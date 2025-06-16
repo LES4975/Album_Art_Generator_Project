@@ -39,8 +39,8 @@ class CorrectedMusicMoodClassifier:
         self.mood_input_shape = [None, 1280]  # [batch, embedding_dim]
         self.mood_output_shape = [None, 56]  # [batch, num_tags]
 
-        # 장르 모델 텐서 정보
-        self.genre_input_name = "serving_default_model_Placeholder:0"  # :0 복구
+        # 장르 모델 텐서 정보 (JSON schema 기반으로 수정)
+        self.genre_input_name = "serving_default_model_Placeholder:0"  # :0 추가 필요
         self.genre_output_name = "PartitionedCall:0"
         self.genre_input_shape = [None, 1280]  # [batch, embedding_dim]
         self.genre_output_shape = [None, 400]  # [batch, num_genres]
@@ -314,8 +314,8 @@ class CorrectedMusicMoodClassifier:
 
     def preprocess_audio_for_discogs(self, audio, sr=16000):
         """
-        Discogs 모델에 맞는 멜 스펙트로그램 생성
-        분석 결과: [64, 128, 96] 형태 필요
+        Essentia 방식의 패치 기반 멜 스펙트로그램 생성
+        128 프레임 패치를 62 프레임씩 이동하며 겹치게 처리
         """
         try:
             # 1. 리샘플링 (16kHz)
@@ -323,59 +323,65 @@ class CorrectedMusicMoodClassifier:
                 audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
                 sr = 16000
 
-            # 2. 배치 크기 64에 맞게 오디오 분할
-            # 전체 길이를 64개 세그먼트로 나누기
-            target_duration_per_segment = len(audio) / 64  # 각 세그먼트의 샘플 수
-            segments = []
+            # 2. Essentia 방식 파라미터
+            frame_size = 512
+            hop_size = 256
+            n_mels = 96
+            patch_size = 128  # 프레임 수
+            patch_hop_size = 62  # 패치 간 이동 프레임 수
 
-            for i in range(64):
-                start_idx = int(i * target_duration_per_segment)
-                end_idx = int((i + 1) * target_duration_per_segment)
-                segment = audio[start_idx:end_idx]
+            # 3. 전체 오디오에 대해 멜 스펙트로그램 계산
+            mel_spec = librosa.feature.melspectrogram(
+                y=audio,
+                sr=sr,
+                n_mels=n_mels,
+                n_fft=frame_size,
+                hop_length=hop_size,
+                fmin=0,
+                fmax=sr / 2
+            )
 
-                if len(segment) == 0:
-                    segments.append(np.zeros(int(target_duration_per_segment)))
-                else:
-                    segments.append(segment)
+            # 로그 스케일 변환 (dB)
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
 
-            # 3. 각 세그먼트에 대해 멜 스펙트로그램 계산
-            mel_spectrograms = []
+            print(f"전체 멜 스펙트로그램 형태: {mel_spec_db.shape}")
 
-            for segment in segments:
-                if len(segment) > 0:
-                    # 멜 스펙트로그램 계산
-                    mel_spec = librosa.feature.melspectrogram(
-                        y=segment,
-                        sr=sr,
-                        n_mels=128,  # 분석 결과에서 확인된 값
-                        n_fft=2048,
-                        hop_length=512,
-                        fmin=0,
-                        fmax=sr / 2
-                    )
+            # 4. 패치 기반 분할 (Essentia 방식)
+            n_frames = mel_spec_db.shape[1]
+            patches = []
 
-                    # 로그 스케일 변환
-                    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            # 패치 시작 위치들 계산
+            patch_starts = list(range(0, n_frames - patch_size + 1, patch_hop_size))
 
-                    # 시간 축을 96으로 맞추기
-                    if mel_spec_db.shape[1] > 96:
-                        mel_spec_db = mel_spec_db[:, :96]
-                    elif mel_spec_db.shape[1] < 96:
-                        pad_width = 96 - mel_spec_db.shape[1]
-                        mel_spec_db = np.pad(mel_spec_db, ((0, 0), (0, pad_width)), mode='constant')
+            # 마지막 패치가 부족하면 추가 (repeat mode)
+            if patch_starts[-1] + patch_size < n_frames:
+                patch_starts.append(n_frames - patch_size)
 
-                    mel_spectrograms.append(mel_spec_db)
-                else:
-                    # 빈 세그먼트의 경우 영행렬
-                    mel_spectrograms.append(np.zeros((128, 96)))
+            # 각 패치 추출
+            for start in patch_starts:
+                end = start + patch_size
+                patch = mel_spec_db[:, start:end]  # [96, 128]
+                patches.append(patch)
 
-            # 4. 배치로 결합: [64, 128, 96]
-            mel_batch = np.array(mel_spectrograms, dtype=np.float32)
+            print(f"생성된 패치 수: {len(patches)}")
 
-            # 5. 정규화
-            mel_batch = (mel_batch - mel_batch.mean()) / (mel_batch.std() + 1e-8)
+            # 5. 64개 패치로 맞추기 (배치 크기 제한)
+            if len(patches) > 64:
+                # 균등하게 샘플링
+                indices = np.linspace(0, len(patches) - 1, 64, dtype=int)
+                patches = [patches[i] for i in indices]
+            elif len(patches) < 64:
+                # 패딩 (마지막 패치 반복)
+                while len(patches) < 64:
+                    patches.append(patches[-1])
 
-            print(f"멜 스펙트로그램 형태: {mel_batch.shape}")
+            # 6. 배치로 결합: [64, 96, 128]
+            mel_batch = np.array(patches, dtype=np.float32)
+
+            # 7. 모델 입력 형태로 변환: [64, 128, 96] (시간축과 주파수축 순서 맞추기)
+            mel_batch = np.transpose(mel_batch, (0, 2, 1))  # [64, 128, 96]
+
+            print(f"최종 배치 형태: {mel_batch.shape}")
             return mel_batch
 
         except Exception as e:
@@ -412,86 +418,71 @@ class CorrectedMusicMoodClassifier:
 
     def classify_genre(self, embeddings):
         """
-        임베딩으로부터 400개 장르 분류 (장르명 포함)
+        임베딩으로부터 400개 장르 분류 (정규화 제거, 원본 사용)
         """
         if self.genre_session is None or embeddings is None:
             return None
 
         try:
-            # 임베딩 평균내기 (배치 차원 제거)
+            # 패치별 임베딩을 평균내지 않고 개별 처리 후 평균
             if len(embeddings.shape) > 1:
-                embeddings_mean = np.mean(embeddings, axis=0, keepdims=True)  # [1, 1280]
+                # 각 패치별로 예측 후 평균 (더 정확)
+                all_predictions = []
+
+                for i in range(embeddings.shape[0]):  # 각 패치에 대해
+                    patch_embedding = embeddings[i:i + 1]  # [1, 1280] 유지
+
+                    # 정규화 없이 원본 사용
+                    input_tensor = self.genre_graph.get_tensor_by_name(self.genre_input_name)
+                    output_tensor = self.genre_graph.get_tensor_by_name(self.genre_output_name)
+
+                    prediction = self.genre_session.run(
+                        output_tensor,
+                        feed_dict={input_tensor: patch_embedding}
+                    )
+
+                    if len(prediction.shape) > 1:
+                        prediction = prediction[0]
+
+                    all_predictions.append(prediction)
+
+                # 모든 패치의 예측을 평균
+                predictions = np.mean(all_predictions, axis=0)
+
+                print(f"🔍 장르 분류 (패치별 처리):")
+                print(f"   처리된 패치 수: {len(all_predictions)}")
+                print(f"   개별 예측 형태: {all_predictions[0].shape}")
+
             else:
-                embeddings_mean = embeddings.reshape(1, -1)
+                # 단일 임베딩인 경우
+                embeddings_input = embeddings.reshape(1, -1)
 
-            # 디버깅 정보 추가
-            print(f"🔍 장르 분류 디버깅:")
-            print(f"   임베딩 입력 형태: {embeddings_mean.shape}")
-            print(f"   임베딩 범위 (정규화 전): [{embeddings_mean.min():.3f}, {embeddings_mean.max():.3f}]")
+                input_tensor = self.genre_graph.get_tensor_by_name(self.genre_input_name)
+                output_tensor = self.genre_graph.get_tensor_by_name(self.genre_output_name)
 
-            # 여러 정규화 방식 시도
-            # 방식 1: 기존 z-score 정규화
-            embeddings_normalized = (embeddings_mean - embeddings_mean.mean()) / (embeddings_mean.std() + 1e-8)
-            print(f"   z-score 정규화 후: [{embeddings_normalized.min():.3f}, {embeddings_normalized.max():.3f}]")
+                predictions = self.genre_session.run(
+                    output_tensor,
+                    feed_dict={input_tensor: embeddings_input}
+                )
 
-            # 방식 2: Min-Max 정규화 (0-1)
-            embeddings_minmax = (embeddings_mean - embeddings_mean.min()) / (
-                        embeddings_mean.max() - embeddings_mean.min() + 1e-8)
-            print(f"   MinMax 정규화 후: [{embeddings_minmax.min():.3f}, {embeddings_minmax.max():.3f}]")
-
-            # 방식 3: L2 정규화
-            embeddings_l2 = embeddings_mean / (np.linalg.norm(embeddings_mean, axis=1, keepdims=True) + 1e-8)
-            print(f"   L2 정규화 후: [{embeddings_l2.min():.3f}, {embeddings_l2.max():.3f}]")
-
-            # 먼저 z-score 정규화로 시도
-            final_embeddings = embeddings_normalized
-
-            # 입력/출력 텐서 가져오기
-            input_tensor = self.genre_graph.get_tensor_by_name(self.genre_input_name)
-            output_tensor = self.genre_graph.get_tensor_by_name(self.genre_output_name)
-
-            print(f"   입력 텐서: {self.genre_input_name}")
-            print(f"   출력 텐서: {self.genre_output_name}")
-
-            # 추론 실행
-            predictions = self.genre_session.run(
-                output_tensor,
-                feed_dict={input_tensor: final_embeddings}  # 정규화된 임베딩 사용
-            )
-
-            # 장르 결과 처리 개선
-            if len(predictions.shape) > 1:
-                predictions = predictions[0]
+                if len(predictions.shape) > 1:
+                    predictions = predictions[0]
 
             print(f"장르 예측 결과 형태: {predictions.shape}")
             print(f"장르 예측 범위: [{predictions.min():.3f}, {predictions.max():.3f}]")
-            print(f"1.0인 값의 개수: {np.sum(predictions == 1.0)}")
-            print(f"0.999 이상인 값의 개수: {np.sum(predictions >= 0.999)}")
+            print(f"평균: {predictions.mean():.3f}, 표준편차: {predictions.std():.3f}")
 
-            # 상위 10개 장르만 반환 (400개는 너무 많음)
-            top_indices = np.argsort(predictions)[-10:][::-1]  # 상위 10개, 내림차순
+            # 상위 10개 장르만 반환
+            top_indices = np.argsort(predictions)[-10:][::-1]
 
             genre_results = []
             for idx in top_indices:
-                # 0.999 미만인 값들만 의미있는 결과로 간주 (더 엄격하게)
-                if predictions[idx] < 0.999:
-                    genre_name = self.genre_classes[idx] if idx < len(self.genre_classes) else f"Unknown Genre {idx}"
-                    genre_results.append({
-                        'index': int(idx),
-                        'genre': genre_name,
-                        'score': float(predictions[idx])
-                    })
-
-            # 만약 모든 값이 0.999에 가깝다면, 상위 5개만 반환 (디버깅용)
-            if len(genre_results) == 0:
-                print("⚠️ 모든 값이 0.999 이상 - 상위 5개만 표시 (디버깅용)")
-                for idx in top_indices[:5]:
-                    genre_name = self.genre_classes[idx] if idx < len(self.genre_classes) else f"Unknown Genre {idx}"
-                    genre_results.append({
-                        'index': int(idx),
-                        'genre': genre_name,
-                        'score': float(predictions[idx])
-                    })
+                genre_name = self.genre_classes[idx] if idx < len(self.genre_classes) else f"Unknown Genre {idx}"
+                genre_results.append({
+                    'index': int(idx),
+                    'genre': genre_name,
+                    'score': float(predictions[idx])
+                })
 
             return genre_results
 
@@ -617,7 +608,7 @@ def main():
     classifier = CorrectedMusicMoodClassifier()
 
     # 음악 파일 경로
-    music_file = "./musics/Pierce_Murphy_-_A_Serpent_I_Did_Hear.mp3"  # 실제 파일 경로로 변경
+    music_file = "./musics/Debussy_-_Arabesque_-_Aufklarung.mp3"  # 실제 파일 경로로 변경
 
     print(f"🎵 실제 Discogs 모델을 사용한 분위기 분석")
     print(f"📁 파일: {music_file}")

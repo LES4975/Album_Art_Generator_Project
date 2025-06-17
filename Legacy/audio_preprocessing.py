@@ -205,7 +205,7 @@ def compare_all_methods(audio_file):
 
 if __name__ == "__main__":
     # 테스트 파일
-    test_file = "./musics/Anitek_-_Tab_+_Anitek_-_Bleach.mp3"
+    test_file = "../musics/Anitek_-_Tab_+_Anitek_-_Bleach.mp3"
 
     if Path(test_file).exists():
         # 완전히 수정된 전처리 테스트

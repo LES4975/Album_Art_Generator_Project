@@ -342,7 +342,7 @@ def print_results(result):
             score = result['all_activations'][function]
             print(f"  • {function}: {score:.4f}")
     else:
-        print("  (임계값을 넘는 기능 없음)")
+        print("  (임계값을 넘는 기능 없음!)")
 
     print(f"\n📊 상위 분위기/테마 (전체):")
     for i, (mood, score) in enumerate(result['moods']['top_all'], 1):

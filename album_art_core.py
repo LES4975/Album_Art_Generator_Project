@@ -1,4 +1,4 @@
-# album_art_generator.py
+# album_art_core.py
 # SDXL Lightning 기반 앨범 아트 생성기 (업데이트 버전)
 
 import os

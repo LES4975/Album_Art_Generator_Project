@@ -1,5 +1,5 @@
-# album_art_core.py
-# 앨범 아트 생성기 핵심 로직 모듈
+# album_art_generator.py
+# SDXL Lightning 기반 앨범 아트 생성기 (업데이트 버전)
 
 import os
 import sys
@@ -8,28 +8,43 @@ import json
 from pathlib import Path
 import time
 
-# Stable Diffusion 관련 imports
-from diffusers import StableDiffusionPipeline
+# SDXL Lightning 관련 imports
+from diffusers import StableDiffusionXLPipeline, EulerDiscreteScheduler
+from huggingface_hub import hf_hub_download
 import torch
 from PIL import Image
 import io
 
 
 class AlbumArtGenerator:
-    """앨범 아트 생성기 메인 클래스"""
+    """앨범 아트 생성기 메인 클래스 (SDXL Lightning 기반)"""
 
-    def __init__(self, music_classifier_path=None, sd_model_id="runwayml/stable-diffusion-v1-5"):
+    def __init__(self, music_classifier_path=None,
+                 base_model="stabilityai/stable-diffusion-xl-base-1.0",
+                 lightning_repo="ByteDance/SDXL-Lightning",
+                 lightning_steps=4):
         """
         초기화
 
         Args:
             music_classifier_path: 음악 분류기 모듈 경로 (None이면 기본 경로 사용)
-            sd_model_id: Stable Diffusion 모델 ID
+            base_model: 기본 SDXL 모델 ID
+            lightning_repo: SDXL Lightning LoRA 리포지토리
+            lightning_steps: Lightning 스텝 수 (2, 4, 8 중 선택)
         """
         self.music_classifier = None
         self.sd_pipeline = None
-        self.sd_model_id = sd_model_id
+        self.base_model = base_model
+        self.lightning_repo = lightning_repo
+        self.lightning_steps = lightning_steps
         self.music_classifier_path = music_classifier_path
+
+        # Lightning 모델 파일명 매핑
+        self.lightning_files = {
+            2: "sdxl_lightning_2step_lora.safetensors",
+            4: "sdxl_lightning_4step_lora.safetensors",
+            8: "sdxl_lightning_8step_lora.safetensors"
+        }
 
         self.setup_models()
 
@@ -40,8 +55,8 @@ class AlbumArtGenerator:
         # 음악 분류기 초기화
         self._setup_music_classifier()
 
-        # Stable Diffusion 파이프라인 초기화
-        self._setup_stable_diffusion()
+        # SDXL Lightning 파이프라인 초기화
+        self._setup_sdxl_lightning()
 
     def _setup_music_classifier(self):
         """음악 분류기 초기화"""
@@ -67,24 +82,56 @@ class AlbumArtGenerator:
             print(f"❌ 음악 분류기 초기화 실패: {e}")
             self.music_classifier = None
 
-    def _setup_stable_diffusion(self):
-        """Stable Diffusion 파이프라인 초기화"""
+    def _setup_sdxl_lightning(self):
+        """SDXL Lightning 파이프라인 초기화"""
         try:
-            self.sd_pipeline = StableDiffusionPipeline.from_pretrained(
-                self.sd_model_id,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                safety_checker=None,
-                requires_safety_checker=False
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"🔧 SDXL Lightning 로딩 중... (디바이스: {device})")
+
+            # 기본 SDXL 파이프라인 로드
+            print(f"📦 기본 SDXL 모델 로딩: {self.base_model}")
+            self.sd_pipeline = StableDiffusionXLPipeline.from_pretrained(
+                self.base_model,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                variant="fp16" if device == "cuda" else None,
+                use_safetensors=True
             )
 
-            if torch.cuda.is_available():
+            # Lightning LoRA 다운로드 및 적용
+            lightning_file = self.lightning_files.get(self.lightning_steps)
+            if not lightning_file:
+                raise ValueError(f"지원하지 않는 스텝 수: {self.lightning_steps}")
+
+            print(f"📦 Lightning {self.lightning_steps}스텝 LoRA 로딩...")
+            lightning_lora_path = hf_hub_download(
+                repo_id=self.lightning_repo,
+                filename=lightning_file
+            )
+
+            # LoRA 어댑터 로드
+            self.sd_pipeline.load_lora_weights(lightning_lora_path)
+
+            # Lightning용 스케줄러 설정
+            self.sd_pipeline.scheduler = EulerDiscreteScheduler.from_config(
+                self.sd_pipeline.scheduler.config,
+                timestep_spacing="trailing"
+            )
+
+            # GPU 최적화
+            if device == "cuda":
                 self.sd_pipeline = self.sd_pipeline.to("cuda")
-                print("✅ Stable Diffusion GPU 로드 완료")
+
+                # T4 GPU 메모리 최적화
+                self.sd_pipeline.enable_attention_slicing()
+                self.sd_pipeline.enable_model_cpu_offload()
+                self.sd_pipeline.enable_vae_slicing()
+
+                print("✅ SDXL Lightning GPU 로드 완료 (최적화)")
             else:
-                print("✅ Stable Diffusion CPU 로드 완료 (속도 느림)")
+                print("✅ SDXL Lightning CPU 로드 완료 (속도 느림)")
 
         except Exception as e:
-            print(f"❌ Stable Diffusion 초기화 실패: {e}")
+            print(f"❌ SDXL Lightning 초기화 실패: {e}")
             self.sd_pipeline = None
 
     def is_ready(self):
@@ -95,7 +142,8 @@ class AlbumArtGenerator:
         """현재 상태 반환"""
         status = {
             "music_classifier": self.music_classifier is not None,
-            "stable_diffusion": self.sd_pipeline is not None,
+            "sdxl_lightning": self.sd_pipeline is not None,
+            "lightning_steps": self.lightning_steps,
             "gpu_available": torch.cuda.is_available()
         }
         return status
@@ -126,10 +174,11 @@ class AlbumArtGenerator:
             return {"error": f"음악 분석 실패: {str(e)}"}
 
     def create_prompt_from_music_analysis(self, music_result, music_title="Unknown"):
-        """음악 분석 결과를 바탕으로 프롬프트 생성"""
+        """음악 분석 결과를 바탕으로 프롬프트 생성 (SDXL Lightning 최적화)"""
 
         if "error" in music_result:
-            return f"Album cover for {music_title}, artistic and creative design", "text, letters, words, watermark, signature, blurry, low quality, ugly"
+            return (f"Album cover for {music_title}, artistic and creative design, professional, high quality",
+                    "text, letters, words, watermark, signature, blurry, low quality, ugly")
 
         # 상위 장르 추출
         top_genres = music_result.get('genres', {}).get('top_genres', [])
@@ -154,7 +203,7 @@ class AlbumArtGenerator:
         if prominent_themes:
             theme_text = ", ".join(prominent_themes[:2])  # 상위 2개만
 
-        # 프롬프트 조합
+        # 프롬프트 조합 (SDXL Lightning에 최적화)
         prompt_parts = [f"Album cover for '{music_title}'"]
 
         if genre_text:
@@ -166,24 +215,27 @@ class AlbumArtGenerator:
         if theme_text:
             prompt_parts.append(f"{theme_text} theme")
 
-        # 기본 스타일 추가
+        # SDXL Lightning에 적합한 스타일 키워드 추가
         prompt_parts.extend([
-            "artistic album cover design",
-            "professional music artwork",
+            "professional album cover design",
+            "artistic illustration",
             "high quality",
-            "detailed illustration"
+            "detailed artwork",
+            "vibrant colors",
+            "modern design",
+            "trending on artstation"
         ])
 
         final_prompt = ", ".join(prompt_parts)
 
-        # 네거티브 프롬프트
-        negative_prompt = "text, letters, words, watermark, signature, blurry, low quality, ugly"
+        # 네거티브 프롬프트 (SDXL Lightning 최적화)
+        negative_prompt = "text, letters, words, watermark, signature, logo, blurry, low quality, ugly, deformed, distorted"
 
         return final_prompt, negative_prompt
 
     def generate_album_art(self, prompt, negative_prompt="", **generation_kwargs):
         """
-        Stable Diffusion으로 앨범 아트 생성
+        SDXL Lightning으로 앨범 아트 생성
 
         Args:
             prompt: 생성 프롬프트
@@ -191,32 +243,41 @@ class AlbumArtGenerator:
             **generation_kwargs: 추가 생성 파라미터
         """
         if self.sd_pipeline is None:
-            return None, "Stable Diffusion 모델이 로드되지 않았습니다"
+            return None, "SDXL Lightning 모델이 로드되지 않았습니다"
 
         try:
-            print(f"🎨 이미지 생성 시작...")
+            print(f"🎨 SDXL Lightning 이미지 생성 시작...")
             print(f"프롬프트: {prompt}")
 
-            # 기본 생성 파라미터
+            # 기본 생성 파라미터 (SDXL Lightning 최적화)
             default_params = {
-                "num_inference_steps": 20,
-                "guidance_scale": 7.5,
-                "width": 512,
-                "height": 512
+                "num_inference_steps": self.lightning_steps,  # Lightning 스텝 수
+                "guidance_scale": 0.0,  # Lightning은 0.0 권장
+                "width": 1024,
+                "height": 1024
             }
 
             # 사용자 파라미터로 덮어쓰기
             default_params.update(generation_kwargs)
 
             # 이미지 생성
-            image = self.sd_pipeline(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                **default_params
-            ).images[0]
+            start_time = time.time()
 
-            print("✅ 이미지 생성 완료")
-            return image, None
+            result = self.sd_pipeline(
+                prompt=prompt,
+                negative_prompt=negative_prompt if negative_prompt else None,
+                **default_params
+            )
+
+            generation_time = time.time() - start_time
+
+            print(f"✅ 이미지 생성 완료 ({generation_time:.1f}초)")
+
+            # GPU 메모리 정리
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return result.images[0], None
 
         except Exception as e:
             error_msg = f"이미지 생성 실패: {str(e)}"
@@ -225,7 +286,7 @@ class AlbumArtGenerator:
 
     def process_music_to_art(self, audio_file, **generation_kwargs):
         """
-        전체 파이프라인: 음악 → 앨범 아트
+        전체 파이프라인: 음악 → 앨범 아트 (SDXL Lightning 기반)
 
         Args:
             audio_file: 음악 파일 경로
@@ -257,14 +318,14 @@ class AlbumArtGenerator:
         print("🔄 2단계: 프롬프트 생성 중...")
         prompt, negative_prompt = self.create_prompt_from_music_analysis(music_result, music_title)
 
-        # 4. 이미지 생성
-        print("🔄 3단계: 앨범 아트 생성 중...")
+        # 4. 이미지 생성 (SDXL Lightning)
+        print("🔄 3단계: SDXL Lightning 앨범 아트 생성 중...")
         generated_image, error = self.generate_album_art(prompt, negative_prompt, **generation_kwargs)
 
         if error:
             return None, f"❌ {error}", analysis_text, prompt
 
-        return generated_image, "✅ 앨범 아트 생성 완료!", analysis_text, prompt
+        return generated_image, "✅ 앨범 아트 생성 완료! (SDXL Lightning)", analysis_text, prompt
 
     def format_analysis_result(self, result):
         """분석 결과를 보기 좋게 포맷팅"""
@@ -311,13 +372,27 @@ class AlbumArtGenerator:
             for i, (mood, score) in enumerate(top_all[:5], 1):
                 text_parts.append(f"  {i}. {mood}: {score:.3f}")
 
+        # Lightning 정보 추가
+        text_parts.append(f"\n🚀 생성 모델: SDXL Lightning ({self.lightning_steps}스텝)")
+
         return "\n".join(text_parts)
+
+    def change_lightning_steps(self, new_steps):
+        """Lightning 스텝 수 변경"""
+        if new_steps in [2, 4, 8]:
+            print(f"🔄 Lightning 스텝 변경: {self.lightning_steps} → {new_steps}")
+            self.lightning_steps = new_steps
+            self._setup_sdxl_lightning()  # 모델 재로드
+        else:
+            print(f"❌ 지원하지 않는 스텝 수: {new_steps} (2, 4, 8만 지원)")
 
 
 # 편의 함수들
-def create_album_art_generator(music_classifier_path=None, sd_model_id="runwayml/stable-diffusion-v1-5"):
-    """앨범 아트 생성기 인스턴스 생성"""
-    return AlbumArtGenerator(music_classifier_path, sd_model_id)
+def create_album_art_generator(music_classifier_path=None,
+                               base_model="stabilityai/stable-diffusion-xl-base-1.0",
+                               lightning_steps=4):
+    """앨범 아트 생성기 인스턴스 생성 (SDXL Lightning)"""
+    return AlbumArtGenerator(music_classifier_path, base_model, lightning_steps=lightning_steps)
 
 
 def extract_music_title(file_path):
@@ -335,3 +410,15 @@ def save_album_art(image, output_path, music_title=None):
 
     image.save(save_path)
     return str(save_path)
+
+
+# 사용 예시
+if __name__ == "__main__":
+    # 생성기 초기화
+    generator = create_album_art_generator(lightning_steps=4)
+
+    if generator.is_ready():
+        print("✅ 앨범 아트 생성기 준비 완료!")
+        print(f"📊 상태: {generator.get_status()}")
+    else:
+        print("❌ 생성기 초기화 실패")

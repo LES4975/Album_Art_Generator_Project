@@ -1,5 +1,5 @@
 # music_classification_colab.py (간소화 버전)
-# 순수 음악 분류 로직만 포함
+# 순수 음악 분류 로직만 포함!
 
 import numpy as np
 import json

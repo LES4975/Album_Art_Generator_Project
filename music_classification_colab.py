@@ -7,7 +7,7 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-# Essentia 라이브러리 import (이미 main.py에서 설치됨)
+# Essentia 라이브러리 import
 from essentia.standard import (
     AudioLoader,
     MonoLoader,
